@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1200" />
+    <title>Novel Writing</title>
+    <script>
+      (function () {
+        var block = function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        };
+        var onKeyDown = function (e) {
+          var key = (e.key || '').toLowerCase();
+          var code = (e.code || '').toLowerCase();
+          var mod = e.ctrlKey || e.metaKey;
+          if (
+            key === 'f12' ||
+            code === 'f12' ||
+            e.keyCode === 123 ||
+            (mod && e.shiftKey && ['i', 'j', 'c', 'k', 'e'].indexOf(key) !== -1) ||
+            (mod && e.altKey && ['i', 'j', 'c', 'u'].indexOf(key) !== -1) ||
+            (mod && !e.shiftKey && !e.altKey && (key === 'u' || key === 's'))
+          ) {
+            return block(e);
+          }
+        };
+        window.addEventListener('contextmenu', block, true);
+        document.addEventListener('contextmenu', block, true);
+        window.addEventListener('keydown', onKeyDown, true);
+        document.addEventListener('keydown', onKeyDown, true);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
