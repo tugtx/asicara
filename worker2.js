@@ -1,5 +1,5 @@
 // 兼容定义默认部署与绑定地址
-const DEFAULT_WORKER_URL = 'https://xs.jiedianguitu.workers.dev';
+const DEFAULT_WORKER_URL = 'https://asicara.zhanghaoqq9999.workers.dev';
 
 export default {
   async fetch(request, env) {
@@ -15,6 +15,42 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // 优先处理非 /api/ 静态前端资源（Cloudflare Workers Static Assets 或新 GitHub Pages 兜底）
+    if (!url.pathname.includes('/api/')) {
+      if (env.ASSETS) {
+        return env.ASSETS.fetch(request);
+      }
+
+      let targetPath = url.pathname;
+      if (targetPath === '/' || targetPath === '') {
+        targetPath = '/asicara/index.html';
+      } else if (!targetPath.startsWith('/asicara/')) {
+        targetPath = '/asicara' + targetPath;
+      }
+
+      const targetUrl = `https://tugtx.github.io${targetPath}${url.search}`;
+      try {
+        const response = await fetch(targetUrl, {
+          headers: {
+            'User-Agent': request.headers.get('User-Agent') || 'Cloudflare Worker Proxy',
+          }
+        });
+
+        const newHeaders = new Headers(response.headers);
+        for (const [key, val] of Object.entries(corsHeaders)) {
+          newHeaders.set(key, val);
+        }
+
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: newHeaders,
+        });
+      } catch (e) {
+        return new Response(`Proxy Error: ${e.message}`, { status: 502, headers: corsHeaders });
+      }
+    }
 
     // 获取绑定的 D1 数据库对象 (增加多重环境名兼容: DB / xs_userdatas / db)
     const dbAdmin = env.DB || env.xs_userdatas || env.db; 
@@ -52,41 +88,6 @@ export default {
     };
 
     try {
-      // 已移除默认的全局自动表初始化，不仅可以大幅度提升每次请求的响应速度，更可以防止他人拷贝部署后免密运行。
-      // 仅可通过手动调用 /api/init-db 接口来进行首次表结构初始化。
-
-      // 如果请求的不是 API 路由，则作为静态网页/资源代理，直接反向代理到 GitHub Pages 的前端页面
-      if (!url.pathname.includes('/api/')) {
-        let targetPath = url.pathname;
-        if (targetPath === '/' || targetPath === '') {
-          targetPath = '/xs/index.html';
-        } else if (!targetPath.startsWith('/xs/')) {
-          targetPath = '/xs' + targetPath;
-        }
-
-        const targetUrl = `https://xiaotuyun.github.io${targetPath}${url.search}`;
-        try {
-          const response = await fetch(targetUrl, {
-            headers: {
-              'User-Agent': request.headers.get('User-Agent') || 'Cloudflare Worker Proxy',
-            }
-          });
-
-          const newHeaders = new Headers(response.headers);
-          // 附加允许跨域头，确保前端能正常加载
-          for (const [key, val] of Object.entries(corsHeaders)) {
-            newHeaders.set(key, val);
-          }
-
-          return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: newHeaders,
-          });
-        } catch (e) {
-          return new Response(`Proxy Error: ${e.message}`, { status: 502, headers: corsHeaders });
-        }
-      }
 
       // 仅用于系统内部的 API 健康检查 /api/health
       if (url.pathname === '/api/health') {
@@ -1175,15 +1176,12 @@ export default {
             });
           }
 
-          // Use Chat Completions format or direct Gemini
+          // Use Chat Completions format when customBaseUrl is provided, or direct Gemini
           let textResult = "";
-          const isGeminiKey = apiKey.startsWith('AIza') || apiKey.startsWith('AQ');
-          const shouldUseOpenAI = (customBaseUrl && useChatCompletions && !isGeminiKey) || (customBaseUrl && !model.toLowerCase().includes('gemini') && !isGeminiKey);
-
-          if (shouldUseOpenAI) {
-            let urlStr = customBaseUrl || 'https://api.openai.com/v1';
-            urlStr = urlStr.replace(/\/+$/, '');
-            if (!urlStr.endsWith('/chat/completions')) {
+          if (customBaseUrl) {
+            let urlStr = customBaseUrl.replace(/\/+$/, '');
+            urlStr = urlStr.replace(/\/(chat\/)?completions$/, '').replace(/\/models$/, '');
+            if (useChatCompletions && !urlStr.endsWith('/chat/completions')) {
               urlStr = `${urlStr}/chat/completions`;
             }
             const response = await fetch(urlStr, {
@@ -1194,23 +1192,27 @@ export default {
               },
               body: JSON.stringify({
                 model,
-                messages: [{ role: "user", content: prompt }]
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.2
               })
             });
+            const resText = await response.text();
+            let data = {};
+            try { data = JSON.parse(resText); } catch {}
             if (response.ok) {
-              const data = await response.json();
-              textResult = data.choices?.[0]?.message?.content || "";
+              textResult = data.choices?.[0]?.message?.content || data.choices?.[0]?.text || "";
             } else {
-              const err = await response.text();
-              throw new Error(`OpenAI 协议接口调用失败 (${response.status}): ${err}`);
+              const errMsg = data.error?.message || data.message || resText || `HTTP ${response.status}`;
+              const lower = String(errMsg).toLowerCase();
+              if (response.status === 429 || lower.includes('rate limit') || lower.includes('quota')) {
+                throw new Error('当前 AI 模型配额已用尽或触发频率限制 (429)，请稍等片刻再试或在「模型配置」切换其他模型。');
+              } else if (response.status === 404 || lower.includes('does not exist') || lower.includes('do not have access')) {
+                throw new Error('当前所选模型不存在或无权访问 (404)，请点击「刷新/获取所有模型」重新选择有效模型。');
+              }
+              throw new Error(`自定义 API 接口返回错误 (${response.status}): ${errMsg}`);
             }
           } else {
-            // Direct Gemini beta API
-            let targetModel = model;
-            if (!targetModel.startsWith('models/') && !targetModel.startsWith('gemini-')) {
-              targetModel = `gemini-1.5-flash`; // Fallback default
-            }
-            const modelClean = targetModel.replace(/^models\//, '');
+            const modelClean = String(model).replace(/^models\//, '');
             const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelClean}:generateContent?key=${apiKey}`;
 
             const response = await fetch(targetUrl, {
@@ -1226,8 +1228,9 @@ export default {
               const data = await response.json();
               textResult = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
             } else {
-              const err = await response.text();
-              throw new Error(`Gemini 接口调用失败 (${response.status}): ${err}`);
+              const errJson = await response.json().catch(() => ({}));
+              const errMsg = errJson?.error?.message || `Gemini API 响应异常 (${response.status})`;
+              throw new Error(errMsg);
             }
           }
 
@@ -1236,6 +1239,305 @@ export default {
           });
         } catch (error) {
           return new Response(JSON.stringify({ success: false, error: error.message || "测试该模型失败" }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          });
+        }
+      }
+
+      // 14. AI Env Config (/api/ai/env-config)
+      if (url.pathname.endsWith('/api/ai/env-config') && request.method === 'GET') {
+        const maskKey = (k) => {
+          const s = String(k || '').trim();
+          if (!s) return '';
+          if (s.length <= 8) return '****';
+          return `${s.slice(0, 4)}****${s.slice(-4)}`;
+        };
+        const geminiKey = String(env.GEMINI_API_KEY || '').trim();
+        const openaiKey = String(env.OPENAI_API_KEY || '').trim();
+        const groqKey = String(env.GROQ_API_KEY || '').trim();
+        const deepseekKey = String(env.DEEPSEEK_API_KEY || '').trim();
+        const hfKey = String(env.HF_TOKEN || env.HUGGINGFACE_TOKEN || '').trim();
+        const customKey = String(env.CUSTOM_API_KEY || '').trim();
+        const primaryKey = customKey || geminiKey || openaiKey || deepseekKey || groqKey;
+
+        return new Response(JSON.stringify({
+          success: true,
+          hasEnvApiKey: Boolean(primaryKey),
+          apiKeyMasked: maskKey(primaryKey),
+          customBaseUrl: String(env.CUSTOM_BASE_URL || '').trim(),
+          customListUrl: String(env.CUSTOM_LIST_URL || '').trim(),
+          defaultModel: String(env.DEFAULT_MODEL || env.MODEL || '').trim(),
+          useChatCompletions: env.USE_CHAT_COMPLETIONS !== 'false',
+          providers: {
+            gemini: { hasEnvApiKey: Boolean(geminiKey), apiKeyMasked: maskKey(geminiKey) },
+            openai: { hasEnvApiKey: Boolean(openaiKey), apiKeyMasked: maskKey(openaiKey) },
+            groq: { hasEnvApiKey: Boolean(groqKey), apiKeyMasked: maskKey(groqKey) },
+            deepseek: { hasEnvApiKey: Boolean(deepseekKey), apiKeyMasked: maskKey(deepseekKey) },
+            huggingface: { hasEnvApiKey: Boolean(hfKey), apiKeyMasked: maskKey(hfKey) },
+            other: { hasEnvApiKey: Boolean(customKey), apiKeyMasked: maskKey(customKey), customBaseUrl: String(env.CUSTOM_BASE_URL || '').trim() },
+          }
+        }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // 15. General AI Chat (/api/ai/chat)
+      if (url.pathname.endsWith('/api/ai/chat') && request.method === 'POST') {
+        try {
+          const body = await request.json().catch(() => ({}));
+          const apiKey = String(body.apiKey || env.CUSTOM_API_KEY || env.GEMINI_API_KEY || '').trim();
+          const model = String(body.model || env.DEFAULT_MODEL || 'gemini-2.5-flash').trim();
+          const customBaseUrl = String(body.customBaseUrl || env.CUSTOM_BASE_URL || '').trim();
+          const messages = Array.isArray(body.messages) ? body.messages : [];
+          const systemInstruction = String(body.systemInstruction || '').trim();
+
+          if (!apiKey) {
+            return new Response(JSON.stringify({ success: false, error: '未配置可用 API Key，请点击右上角「模型配置」填写 API Key。' }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+          }
+
+          let text = '';
+          if (customBaseUrl) {
+            let targetUrl = customBaseUrl.replace(/\/+$/, '').replace(/\/(chat\/)?completions$/, '').replace(/\/models$/, '');
+            targetUrl = `${targetUrl}/chat/completions`;
+            const openAiMsgs = [];
+            if (systemInstruction) openAiMsgs.push({ role: 'system', content: systemInstruction });
+            for (const m of messages) {
+              openAiMsgs.push({ role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user', content: String(m.text || m.content || '') });
+            }
+            const resp = await fetch(targetUrl, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model, messages: openAiMsgs, temperature: 0.7 })
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.error?.message || data.message || `API 错误 (${resp.status})`);
+            }
+            text = data.choices?.[0]?.message?.content || '';
+          } else {
+            const cleanModel = model.replace(/^models\//, '');
+            const contents = messages.map((m) => ({
+              role: m.role === 'assistant' || m.role === 'model' ? 'model' : 'user',
+              parts: [{ text: String(m.text || m.content || '') }]
+            }));
+            const payload = { contents };
+            if (systemInstruction) {
+              payload.systemInstruction = { parts: [{ text: systemInstruction }] };
+            }
+            const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${apiKey}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.error?.message || `Gemini API 错误 (${resp.status})`);
+            }
+            text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+          }
+
+          return new Response(JSON.stringify({ success: true, text }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({ success: false, error: error.message || 'AI 对话失败' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          });
+        }
+      }
+
+      // 16. Consultation Reply (/api/ai/consultation-reply & /api/ai/buyer-reply)
+      if ((url.pathname.endsWith('/api/ai/consultation-reply') || url.pathname.endsWith('/api/ai/buyer-reply')) && request.method === 'POST') {
+        try {
+          const body = await request.json().catch(() => ({}));
+          const cleanOtherMsg = String(body.otherMessage ?? body.sellerMessage ?? '').trim();
+          if (!cleanOtherMsg) {
+            return new Response(JSON.stringify({ success: false, error: '请先输入对方发来的消息或发言内容。' }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+          }
+
+          const effectiveApiKey = String(body.apiKey || env.CUSTOM_API_KEY || env.GEMINI_API_KEY || '').trim();
+          const effectiveModel = String(body.model || env.DEFAULT_MODEL || (effectiveApiKey ? 'gemini-2.5-flash' : '')).trim();
+          const customBaseUrl = String(body.customBaseUrl || env.CUSTOM_BASE_URL || '').trim();
+          const selectedModels = Array.isArray(body.selectedModels) ? body.selectedModels : [];
+
+          if (!effectiveApiKey || !effectiveModel) {
+            return new Response(JSON.stringify({ success: false, error: '未配置可用 API Key 或模型，请先在右上角「模型配置」中填写并选择。' }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+          }
+
+          const effectiveMyRole = String(body.myRole || '买家 / 咨询方').trim();
+          const effectiveOtherRole = String(body.otherRole || '对方').trim();
+          const effectiveBackground = String(body.backgroundInfo ?? body.productInfo ?? '').trim();
+          const effectiveGoal = String(body.myGoal ?? body.buyerGoal ?? '').trim();
+          const effectiveCategory = String(body.category || '通用沟通').trim();
+          const history = Array.isArray(body.history) ? body.history : [];
+
+          const historyText = history.length > 0
+            ? history.slice(-12).map((item) => {
+                const isMe = item.role === 'me' || item.role === 'buyer' || item.role === 'user';
+                return `${isMe ? `我（${effectiveMyRole}）` : `对方（${effectiveOtherRole}）`}：${String(item.content || '').trim()}`;
+              }).join('\n')
+            : '无前置对话记录';
+
+          const refineText = body.refineInstruction
+            ? `\n【本轮微调要求】\n用户希望针对上一轮建议按如下要求调整：${String(body.refineInstruction).trim()}`
+            : '';
+
+          const prompt = `你是一位经验丰富、深谙各类社交、职场、购物、商务与生活沟通技巧的“全场景高情商回复顾问”。
+现在用户需要以【${effectiveMyRole}】的身份回复【${effectiveOtherRole}】的发言。请你结合当前场景与背景信息，严格站在【${effectiveMyRole}】的视角，生成 3 条不同策略、自然口语化、可直接复制发送的回复话术，并附上一句简明扼要的对方话术意图拆解与应对提醒。
+
+【沟通场景与双方信息】
+- 咨询类型：${effectiveCategory}
+- 我方身份：${effectiveMyRole}
+- 对方身份：${effectiveOtherRole}
+- 沟通渠道/环境：${body.platform || '通用聊天'}
+- 背景/事项补充：${effectiveBackground || '未补充'}
+- 本轮沟通目标：${body.scenario || '得体回应并推进沟通'}
+- 期望回复语气：${body.tone || '高情商温和'}
+- 我方具体诉求：${effectiveGoal || '无特殊补充，帮我得体回应、争取主动权并避免吃亏'}
+
+【历史对话上下文】
+${historyText}
+
+【对方（${effectiveOtherRole}）最新发言】
+${cleanOtherMsg}
+${refineText}
+
+【撰写要求】
+1. 必须严格站在我方身份「${effectiveMyRole}」的视角说话。
+2. 话术必须贴合真实自然口语表达，简练地道。
+3. 3 个方案要有策略区分（高情商推进版 / 直截了当版 / 细节把控版）。
+4. analysis（同时也写入 sellerAnalysis）用 1-2 句话拆解对方意图与风险点。
+5. 客观输出 analysisConfidence（0-100 整数）、confidenceReason、以及每个方案的 confidence（0-100 整数）和 confidenceNote。
+6. 只输出合法 JSON 对象，格式如下：
+{"analysis":"对方意图拆解与建议","analysisConfidence":88,"confidenceReason":"原因","replies":[{"style":"高情商推进版","tag":"推荐","confidence":92,"confidenceNote":"依据","content":"话术正文"},{"style":"直截了当版","tag":"高效","confidence":84,"confidenceNote":"依据","content":"话术正文"},{"style":"细节把控版","tag":"稳妥","confidence":87,"confidenceNote":"依据","content":"话术正文"}]}`;
+
+          const modelsToTry = [effectiveModel, ...selectedModels.filter((m) => m && m !== effectiveModel)];
+          let rawText = '';
+          let usedModel = effectiveModel;
+          let lastErr = null;
+
+          for (const candidateModel of modelsToTry) {
+            try {
+              if (customBaseUrl) {
+                let targetUrl = customBaseUrl.replace(/\/+$/, '').replace(/\/(chat\/)?completions$/, '').replace(/\/models$/, '');
+                targetUrl = `${targetUrl}/chat/completions`;
+                const resp = await fetch(targetUrl, {
+                  method: 'POST',
+                  headers: { 'Authorization': `Bearer ${effectiveApiKey}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ model: candidateModel, messages: [{ role: 'user', content: prompt }], temperature: 0.7 })
+                });
+                const resText = await resp.text();
+                let data = {};
+                try { data = JSON.parse(resText); } catch {}
+                if (!resp.ok) {
+                  const errMsg = data.error?.message || data.message || resText || `HTTP ${resp.status}`;
+                  const err = new Error(errMsg);
+                  err.status = resp.status;
+                  throw err;
+                }
+                rawText = data.choices?.[0]?.message?.content || data.choices?.[0]?.text || '';
+              } else {
+                const cleanModel = candidateModel.replace(/^models\//, '');
+                const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${effectiveApiKey}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0.7, responseMimeType: 'application/json' }
+                  })
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                  const errMsg = data.error?.message || `Gemini API 错误 (${resp.status})`;
+                  const err = new Error(errMsg);
+                  err.status = resp.status;
+                  throw err;
+                }
+                rawText = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+              }
+              if (rawText.trim()) {
+                usedModel = candidateModel;
+                break;
+              }
+            } catch (e) {
+              lastErr = e;
+            }
+          }
+
+          if (!rawText.trim()) {
+            throw lastErr || new Error('模型未返回有效内容');
+          }
+
+          let parsed = null;
+          try {
+            let cleanJson = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
+            const fb = cleanJson.indexOf('{');
+            const lb = cleanJson.lastIndexOf('}');
+            if (fb !== -1 && lb !== -1) cleanJson = cleanJson.slice(fb, lb + 1);
+            parsed = JSON.parse(cleanJson);
+          } catch {
+            parsed = null;
+          }
+
+          const normalizeConf = (val, fallback) => {
+            const n = Number(val);
+            if (!Number.isFinite(n) || n <= 0) return fallback;
+            const pct = n <= 1 ? Math.round(n * 100) : Math.round(n);
+            return Math.min(99, Math.max(10, pct));
+          };
+
+          if (!parsed || !Array.isArray(parsed.replies) || parsed.replies.length === 0) {
+            parsed = {
+              analysis: '已结合对方发言生成参考回复，建议发送前结合实际情况微调细节。',
+              analysisConfidence: 76,
+              confidenceReason: '模型返回非标准结构，已自动提取核心回复文本。',
+              replies: [{ style: 'AI 生成回复', tag: '可用', confidence: 76, confidenceNote: '基础可用话术', content: rawText.trim() }]
+            };
+          }
+
+          const analysisText = String(parsed.analysis || parsed.sellerAnalysis || '').trim();
+          const analysisConfidence = normalizeConf(parsed.analysisConfidence, 82);
+          const confidenceReason = String(parsed.confidenceReason || '基于当前对话上下文与诉求综合评估。').trim();
+
+          return new Response(JSON.stringify({
+            success: true,
+            analysis: analysisText,
+            sellerAnalysis: analysisText,
+            analysisConfidence,
+            confidenceReason,
+            replies: parsed.replies.filter((r) => r && String(r.content || '').trim()).map((r, idx) => ({
+              style: String(r.style || `回复方案 ${idx + 1}`).trim(),
+              tag: String(r.tag || '话术').trim(),
+              confidence: normalizeConf(r.confidence, Math.max(72, analysisConfidence - idx * 3)),
+              confidenceNote: String(r.confidenceNote || '结合当前角色与期望语气评估').trim(),
+              content: String(r.content || '').trim(),
+            })),
+            modelUsed: usedModel,
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          });
+        } catch (error) {
+          let errMsg = String(error?.message || '生成回复失败，请检查模型或 API Key 配置。');
+          const lower = errMsg.toLowerCase();
+          if (lower.includes('api key not valid') || lower.includes('api_key_invalid') || lower.includes('unauthenticated')) {
+            errMsg = '当前 API Key 无效或未配置，请在「模型配置」填写有效 Key。';
+          } else if (lower.includes('rate_limit') || lower.includes('rate limit') || lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted')) {
+            errMsg = '当前 AI 模型配额已用尽或触发频率限制 (429)，请稍后再试或切换其他模型。';
+          } else if (lower.includes('does not exist') || lower.includes('do not have access') || lower.includes('404')) {
+            errMsg = '当前所选模型不存在或无权限访问 (404)，请在「模型配置」刷新并选择可用模型。';
+          }
+          return new Response(JSON.stringify({ success: false, error: errMsg }), {
             status: 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
           });
